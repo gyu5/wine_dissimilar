@@ -128,8 +128,12 @@ simulate_pairwise_choice <- function(rating_mat, corr_mat, k = 10, n_sim = 1000)
   )
 }
 
-simulate_pairwise_compare <- function(rating_mat, corr_mat, k = 10, n_sim = 1000) {
-  user_ids <- intersect(colnames(rating_mat), rownames(corr_mat))
+simulate_pairwise_compare <- function(rating_mat, corr_mat, k = 10, n_sim = 1000, user_ids = NULL) {
+  if (is.null(user_ids)) {
+    user_ids <- intersect(colnames(rating_mat), rownames(corr_mat))
+  } else {
+    user_ids <- intersect(user_ids, intersect(colnames(rating_mat), rownames(corr_mat)))
+  }
   if (length(user_ids) == 0) stop("相関行列と評価行列でユーザIDが一致しません", call. = FALSE)
 
   signed_correct <- 0L
@@ -200,6 +204,75 @@ simulate_pairwise_compare <- function(rating_mat, corr_mat, k = 10, n_sim = 1000
   )
 }
 
+compute_user_sharpness <- function(corr_mat, rating_mat) {
+  user_ids <- intersect(colnames(rating_mat), rownames(corr_mat))
+  rows <- vector("list", length(user_ids))
+  for (i in seq_along(user_ids)) {
+    uid <- user_ids[i]
+    sims <- corr_mat[uid, user_ids]
+    sims <- sims[user_ids != uid]
+    sims <- sims[is.finite(sims)]
+    if (length(sims) == 0) next
+
+    u_col <- match(uid, colnames(rating_mat))
+    user_ratings <- rating_mat[, u_col]
+    user_ratings <- user_ratings[is.finite(user_ratings)]
+
+    rows[[i]] <- data.frame(
+      user_id = uid,
+      neg_ratio = mean(sims < 0),
+      mean_corr = mean(sims),
+      rating_sd = if (length(user_ratings) >= 2) stats::sd(user_ratings) else NA_real_,
+      n_rated = length(user_ratings)
+    )
+  }
+  out <- do.call(rbind, rows)
+  rownames(out) <- NULL
+  out
+}
+
+run_stratified_eval <- function(rating_mat, corr_mat, k_values, n_sim, sharp_df, top_frac = 0.25, bottom_frac = 0.25) {
+  hi_th <- as.numeric(stats::quantile(sharp_df$neg_ratio, probs = 1 - top_frac, na.rm = TRUE, type = 7))
+  lo_th <- as.numeric(stats::quantile(sharp_df$neg_ratio, probs = bottom_frac, na.rm = TRUE, type = 7))
+
+  sharp_users <- sharp_df$user_id[sharp_df$neg_ratio >= hi_th]
+  mild_users <- sharp_df$user_id[sharp_df$neg_ratio <= lo_th]
+
+  cat(sprintf("\n[層別条件] top=%.0f%%, bottom=%.0f%%\n", top_frac * 100, bottom_frac * 100))
+  cat(sprintf("neg_ratio 閾値: sharp >= %.4f, mild <= %.4f\n", hi_th, lo_th))
+  cat(sprintf("ユーザ数: sharp=%d, mild=%d\n", length(sharp_users), length(mild_users)))
+
+  rows <- list()
+  for (k in k_values) {
+    res_sharp <- simulate_pairwise_compare(rating_mat, corr_mat, k = k, n_sim = n_sim, user_ids = sharp_users)
+    res_mild <- simulate_pairwise_compare(rating_mat, corr_mat, k = k, n_sim = n_sim, user_ids = mild_users)
+
+    mc_sharp <- mcnemar.test(res_sharp$pair_table, correct = TRUE)
+    mc_mild <- mcnemar.test(res_mild$pair_table, correct = TRUE)
+
+    rows[[length(rows) + 1L]] <- data.frame(
+      group = "sharp",
+      k = k,
+      n = res_sharp$n,
+      signed_acc = res_sharp$signed_accuracy,
+      baseline_acc = res_sharp$baseline_accuracy,
+      gain = res_sharp$accuracy_gain,
+      mcnemar_p = mc_sharp$p.value
+    )
+    rows[[length(rows) + 1L]] <- data.frame(
+      group = "mild",
+      k = k,
+      n = res_mild$n,
+      signed_acc = res_mild$signed_accuracy,
+      baseline_acc = res_mild$baseline_accuracy,
+      gain = res_mild$accuracy_gain,
+      mcnemar_p = mc_mild$p.value
+    )
+  }
+
+  do.call(rbind, rows)
+}
+
 main <- function() {
   root <- get_project_root()
   amateurs <- read_rating_matrix(file.path(root, "data", "amateurs.csv"))
@@ -241,6 +314,41 @@ main <- function() {
   summary_df <- do.call(rbind, summary_rows)
   cat("\n=== Summary table ===\n")
   print(summary_df, row.names = FALSE)
+
+  sharp_df <- compute_user_sharpness(corr_mat, rating_mat)
+  cat("\n=== Sharpness summary (neg_ratio) ===\n")
+  print(summary(sharp_df$neg_ratio))
+
+  cat("\n=== Stratified result: top25% vs bottom25% (by neg_ratio) ===\n")
+  strat_25 <- run_stratified_eval(
+    rating_mat = rating_mat,
+    corr_mat = corr_mat,
+    k_values = k_values,
+    n_sim = n_sim,
+    sharp_df = sharp_df,
+    top_frac = 0.25,
+    bottom_frac = 0.25
+  )
+  print(strat_25, row.names = FALSE)
+
+  cat("\n=== Threshold sensitivity (k=20, top/bottom %) ===\n")
+  sens_fracs <- c(0.20, 0.25, 0.30, 0.40)
+  sens_rows <- list()
+  for (f in sens_fracs) {
+    s <- run_stratified_eval(
+      rating_mat = rating_mat,
+      corr_mat = corr_mat,
+      k_values = c(20),
+      n_sim = n_sim,
+      sharp_df = sharp_df,
+      top_frac = f,
+      bottom_frac = f
+    )
+    s$frac <- f
+    sens_rows[[length(sens_rows) + 1L]] <- s
+  }
+  sens_df <- do.call(rbind, sens_rows)
+  print(sens_df[, c("frac", "group", "k", "signed_acc", "baseline_acc", "gain", "mcnemar_p")], row.names = FALSE)
 }
 
 main()
